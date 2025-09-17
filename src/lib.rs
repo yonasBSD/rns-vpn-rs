@@ -31,6 +31,7 @@ pub struct Client {
 
 #[derive(Debug)]
 pub enum CreateClientError {
+  ConfigError(String),
   RiptunError(riptun::Error),
   IpAddBroadcastError(std::io::Error),
   IpLinkUpError(std::io::Error),
@@ -45,6 +46,12 @@ struct Tun {
 
 impl Client {
   pub fn new(config: Config) -> Result<Self, CreateClientError> {
+    if config.peers.contains_key(&config.vpn_ip) {
+      log::error!("configured VPN IP ({}) conflicts with peer IPs: {:?}",
+        config.vpn_ip, config.peers);
+      return Err(CreateClientError::ConfigError(
+        "configured VPN IP exists in peer IPs".to_owned()))
+    }
     let tun = Tun::new(config.vpn_ip)?;
     Ok(Client { config, tun })
   }
