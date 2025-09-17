@@ -16,12 +16,16 @@ use riptun::TokioTun;
 const TUN_NQUEUES : usize = 1;
 const MTU: usize = 1500;
 
+const fn default_announce_freq_secs() -> u32 { 1 }
+
 #[derive(Deserialize, Serialize)]
 pub struct Config {
   pub vpn_ip: IpNet,
   /// Map of (IP, destination)
   // TODO: deserialize AddressHash
-  pub peers: BTreeMap<IpNet, String>
+  pub peers: BTreeMap<IpNet, String>,
+  #[serde(default = "default_announce_freq_secs")]
+  pub announce_freq_secs: u32
 }
 
 pub struct Client {
@@ -64,9 +68,12 @@ impl Client {
     // send announces
     let announce_loop = async || loop {
       transport.send_announce(&in_destination, None).await;
-      tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+      tokio::time::sleep(
+        std::time::Duration::from_secs(self.config.announce_freq_secs as u64)
+      ).await;
     };
-    let link_id: Arc<tokio::sync::Mutex<Option<LinkId>>> = Arc::new(tokio::sync::Mutex::new(None));
+    let link_id: Arc<tokio::sync::Mutex<Option<LinkId>>> =
+      Arc::new(tokio::sync::Mutex::new(None));
     // tun loop
     let tun_loop = async || while let Ok(bytes) = self.tun.read().await {
       log::trace!("got tun bytes ({})", bytes.len());
@@ -129,7 +136,8 @@ impl Tun {
   pub fn new(ip: IpNet) -> Result<Self, CreateClientError> {
     log::debug!("creating tun device");
     let ip: IpNet = ip.into();
-    let tun = TokioTun::new("rip%d", TUN_NQUEUES).map_err(CreateClientError::RiptunError)?;
+    let tun = TokioTun::new("rip%d", TUN_NQUEUES)
+      .map_err(CreateClientError::RiptunError)?;
     log::debug!("created tun device: {}", tun.name());
     log::debug!("adding broadcast ip addr: {}", ip);
     let output = std::process::Command::new("ip")
@@ -158,7 +166,8 @@ impl Tun {
       .map_err(CreateClientError::IpLinkUpError)?;
     if !output.status.success() {
       return Err(CreateClientError::IpLinkUpError(
-        std::io::Error::other(format!("ip link set command failed ({:?})", output.status.code()))))
+        std::io::Error::other(format!("ip link set command failed ({:?})",
+          output.status.code()))))
     }
     let adapter = Tun {
       tun, read_buf: tokio::sync::Mutex::new([0x0; MTU])
