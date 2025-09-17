@@ -1,16 +1,18 @@
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::net::IpAddr;
 
-use serde::{Deserialize, Serialize};
+use etherparse;
 use ipnet::IpNet;
 use log;
+use riptun::TokioTun;
+use serde::{Deserialize, Serialize};
+use tokio;
+
 use reticulum::destination::DestinationName;
 use reticulum::destination::link::{LinkEvent, LinkId};
 use reticulum::hash::AddressHash;
 use reticulum::identity::PrivateIdentity;
 use reticulum::transport::Transport;
-
-use riptun::TokioTun;
 
 // TODO: config?
 const TUN_NQUEUES : usize = 1;
@@ -43,6 +45,12 @@ pub enum CreateClientError {
   IptablesError(std::io::Error)
 }
 
+struct Peer {
+  dest: AddressHash,
+  link_id: Option<LinkId>,
+  link_active: bool
+}
+
 struct Tun {
   tun: TokioTun,
   read_buf: tokio::sync::Mutex<[u8; MTU]>
@@ -61,6 +69,23 @@ impl Client {
   }
 
   pub async fn run(&self, mut transport: Transport, id: PrivateIdentity) {
+    // set up peer map
+    let peer_map = {
+      let mut peer_map = BTreeMap::<IpAddr, Peer>::new();
+      for (ip, dest) in self.config.peers.iter() {
+        let dest = match AddressHash::new_from_hex_string(dest.as_str()) {
+          Ok(dest) => dest,
+          Err(err) => {
+            log::error!("error parsing peer destination hash: {err:?}");
+            return
+          }
+        };
+        let peer = Peer { dest, link_id: None, link_active: false };
+        assert!(peer_map.insert(ip.addr(), peer).is_none());
+      }
+      tokio::sync::Mutex::new(peer_map)
+    };
+    // create in destination
     let in_destination = transport
       .add_destination(id, DestinationName::new("rns_vpn", "client")).await;
     let in_destination_hash = in_destination.lock().await.desc.address_hash;
@@ -72,33 +97,59 @@ impl Client {
         std::time::Duration::from_secs(self.config.announce_freq_secs as u64)
       ).await;
     };
-    let link_id: Arc<tokio::sync::Mutex<Option<LinkId>>> =
-      Arc::new(tokio::sync::Mutex::new(None));
-    // tun loop
-    let tun_loop = async || while let Ok(bytes) = self.tun.read().await {
-      log::trace!("got tun bytes ({})", bytes.len());
-      let link_id = link_id.lock().await;
-      if let Some(link_id) = link_id.as_ref() {
-        log::trace!("sending on link ({})", link_id);
-        let link = transport.find_in_link(link_id).await.unwrap();
-        let link = link.lock().await;
-        let packet = link.data_packet(&bytes).unwrap();
-        transport.send_packet(packet).await;
+    // set up links
+    let link_loop = async || {
+      let mut announce_recv = transport.recv_announces().await;
+      while let Ok(announce) = announce_recv.recv().await {
+        let destination = announce.destination.lock().await;
+        // loop up destination in peers
+        for peer in peer_map.lock().await.values_mut() {
+          if destination.desc.address_hash == peer.dest {
+            if peer.link_id.is_none() {
+              let link = transport.link(destination.desc).await;
+              peer.link_id = Some(link.lock().await.id().clone());
+              log::debug!("created link {} for peer {}",
+                peer.link_id.as_ref().unwrap(), peer.dest);
+              peer.link_active = false;   // wait for link activated event
+            }
+          }
+        }
       }
     };
-    // upstream link data
-    let link_loop = async || {
-      let mut peer_map = BTreeMap::new();
-      for (ip, dest) in self.config.peers.iter() {
-        let dest = match AddressHash::new_from_hex_string(dest.as_str()) {
-          Ok(dest) => dest,
-          Err(err) => {
-            log::error!("error parsing peer destination hash: {err:?}");
-            return
+    // tun loop: read data from tun and send on links
+    let tun_loop = async || {
+      while let Ok(bytes) = self.tun.read().await {
+        log::trace!("got tun bytes ({})", bytes.len());
+        if let Ok((ip_header, _)) = etherparse::IpHeaders::from_slice(bytes.as_slice())
+          .map_err(|e| log::error!("couldn't parse packet from tun: {e:?}"))
+        {
+          let mut destination_ip = None;
+          if let Some((ipv4_header, _)) = ip_header.ipv4() {
+            destination_ip = Some(IpAddr::from(ipv4_header.destination));
+          } else if let Some((ipv6_header, _)) = ip_header.ipv6() {
+            destination_ip = Some(IpAddr::from(ipv6_header.destination));
+          } else {
+            log::error!("failed to get ipv4 or ipv6 headers from ip header: {:?}", ip_header);
           }
-        };
-        assert!(peer_map.insert(*ip, dest).is_none());
+          if let Some(destination_ip) = destination_ip {
+            if let Some(peer) = peer_map.lock().await.get(&destination_ip) {
+              if let Some(link_id) = peer.link_id.as_ref() {
+                if let Some(link) = transport.find_out_link(&peer.dest).await {
+                  log::trace!("sending to {} on link {}", peer.dest, link_id);
+                  let link = link.lock().await;
+                  let packet = link.data_packet(&bytes).unwrap();
+                  transport.send_packet(packet).await;
+                } else {
+                  log::warn!("could not get link {} for peer {}", link_id, peer.dest);
+                }
+              }
+            }
+          }
+        }
       }
+    };
+    // upstream link data: put link data into tun
+    let upstream_loop = async || {
       let mut in_link_events = transport.in_link_events();
       while let Ok(link_event) = in_link_events.recv().await {
         match link_event.event {
@@ -114,8 +165,12 @@ impl Client {
           }
           LinkEvent::Activated => if link_event.address_hash == in_destination_hash {
             log::debug!("link activated {}", link_event.id);
-            let mut link_id = link_id.lock().await;
-            *link_id = Some(link_event.id);
+            // loop up destination in peers
+            for peer in peer_map.lock().await.values_mut() {
+              if peer.link_id == Some(link_event.id) {
+                peer.link_active = true;
+              }
+            }
           }
           LinkEvent::Closed => if link_event.address_hash == in_destination_hash {
             log::debug!("link closed {}", link_event.id)
@@ -125,8 +180,9 @@ impl Client {
     };
     tokio::select!{
       _ = announce_loop() => log::info!("announce loop exited: shutting down"),
-      _ = tun_loop() => log::info!("tun loop exited: shutting down"),
       _ = link_loop() => log::info!("link loop exited: shutting down"),
+      _ = tun_loop() => log::info!("tun loop exited: shutting down"),
+      _ = upstream_loop() => log::info!("upstream loop exited: shutting down"),
       _ = tokio::signal::ctrl_c() => log::info!("got ctrl-c: shutting down")
     }
   }

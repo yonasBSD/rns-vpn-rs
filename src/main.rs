@@ -41,7 +41,6 @@ async fn main() {
     let s = fs::read_to_string(CONFIG_PATH).unwrap();
     toml::from_str(&s).unwrap()
   };
-  /*FIXME:debug*/ println!("{:?}", std::env::var("RUST_LOG"));
   // init logging
   env_logger::Builder::from_env(env_logger::Env::default()).init();
   log::info!("client start with port {} and forward IP {}", cmd.port, cmd.forward);
