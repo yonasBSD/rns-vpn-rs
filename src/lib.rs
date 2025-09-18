@@ -23,9 +23,8 @@ const fn default_announce_freq_secs() -> u32 { 1 }
 #[derive(Deserialize, Serialize)]
 pub struct Config {
   pub vpn_ip: IpNet,
-  /// Map of (IP, destination)
-  // TODO: deserialize AddressHash
-  pub peers: BTreeMap<IpNet, String>,
+  /// Map of (IP, destination hash)
+  pub peers: BTreeMap<IpAddr, String>,
   #[serde(default = "default_announce_freq_secs")]
   pub announce_freq_secs: u32
 }
@@ -58,7 +57,7 @@ struct Tun {
 
 impl Client {
   pub fn new(config: Config) -> Result<Self, CreateClientError> {
-    if config.peers.contains_key(&config.vpn_ip) {
+    if config.peers.contains_key(&config.vpn_ip.addr()) {
       log::error!("configured VPN IP ({}) conflicts with peer IPs: {:?}",
         config.vpn_ip, config.peers);
       return Err(CreateClientError::ConfigError(
@@ -72,7 +71,7 @@ impl Client {
     // set up peer map
     let peer_map = {
       let mut peer_map = BTreeMap::<IpAddr, Peer>::new();
-      for (ip, dest) in self.config.peers.iter() {
+      for (ip, dest) in self.config.peers.iter().map(|(k,v)| (k.clone(), v.clone())) {
         let dest = match AddressHash::new_from_hex_string(dest.as_str()) {
           Ok(dest) => dest,
           Err(err) => {
@@ -81,7 +80,7 @@ impl Client {
           }
         };
         let peer = Peer { dest, link_id: None, link_active: false };
-        assert!(peer_map.insert(ip.addr(), peer).is_none());
+        assert!(peer_map.insert(ip, peer).is_none());
       }
       tokio::sync::Mutex::new(peer_map)
     };
