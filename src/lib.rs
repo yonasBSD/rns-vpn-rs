@@ -137,6 +137,7 @@ impl Client {
                   log::trace!("sending to {} on link {}", peer.dest, link_id);
                   let link = link.lock().await;
                   let packet = link.data_packet(&bytes).unwrap();
+                  drop(link);
                   transport.send_packet(packet).await;
                 } else {
                   log::warn!("could not get link {} for peer {}", link_id, peer.dest);
