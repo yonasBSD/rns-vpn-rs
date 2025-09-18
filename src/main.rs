@@ -42,7 +42,8 @@ async fn main() {
     toml::from_str(&s).unwrap()
   };
   // init logging
-  env_logger::Builder::from_env(env_logger::Env::default()).init();
+  env_logger::Builder::new().filter_level(log::LevelFilter::Info).parse_default_env()
+    .init();
   log::info!("client start with port {} and forward IP {}", cmd.port, cmd.forward);
   // client
   let client = match rns_vpn::Client::new(config) {
@@ -51,7 +52,8 @@ async fn main() {
       rns_vpn::CreateClientError::RiptunError(riptun::Error::Unix {
         source: nix::errno::Errno::EPERM
       }) => {
-        log::error!("EPERM error creating VPN client: need to run with root permissions");
+        log::error!("EPERM error creating TUN interface: \
+          need to run with root permissions");
         process::exit(1)
       }
       _ => {

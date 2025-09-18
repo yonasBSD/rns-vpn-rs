@@ -88,7 +88,8 @@ impl Client {
     let in_destination = transport
       .add_destination(id, DestinationName::new("rns_vpn", "client")).await;
     let in_destination_hash = in_destination.lock().await.desc.address_hash;
-    log::info!("created in destination: {}", in_destination_hash);
+    log::info!("created destination: {}",
+      format!("{}", in_destination_hash).trim_matches('/'));
     // send announces
     let announce_loop = async || loop {
       transport.send_announce(&in_destination, None).await;

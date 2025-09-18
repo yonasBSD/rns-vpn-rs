@@ -22,6 +22,9 @@ arguments.
 
 Private keys can be generated with `openssl` tool using the `genkeys.sh` script.
 
+Running with log level INFO will log the destination hash generated for the clients
+configured private keys and should be provided to peers to add to their configurations.
+
 Command-line options:
 
 `-p <port>` -- required: local UDP port for Reticulum interface
@@ -39,4 +42,4 @@ identity
 `RNS_VPN_SIGNKEY_PATH` -- path to ed25519 signing key in PEM format for Reticulum
 identity
 
-`RUST_LOG` -- set log level: `trace`, `debug`, `info`, `warn`, `error`
+`RUST_LOG` -- adjust log level: `trace`, `debug`, `info` (default), `warn`, `error`
