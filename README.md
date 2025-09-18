@@ -10,6 +10,8 @@ Building `Reticulum-rs` requires `protoc` binary for compiling `.proto` files.
 
 ## Client configuration
 
+`Config.toml`
+
 `vpn_ip` -- the IP assigned to this client in CIDR format (e.g. `10.0.0.1/24`)
 
 `peers` -- a map of `<ip> = <destination-hash>` pairs for each peer to communicate with
