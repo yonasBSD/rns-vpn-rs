@@ -45,3 +45,20 @@ identity
 identity
 
 `RUST_LOG` -- adjust log level: `trace`, `debug`, `info` (default), `warn`, `error`
+
+### Usage
+
+While the client application is running and connected, peers can be reached via their
+configured IP addresses and the traffic will be routed over Reticulum. For example a
+peer at 10.0.0.1 serving a UDP echo server:
+```
+# on 10.0.0.1
+$ ncat -u -l 10.0.0.1 12345 --sh-exec 'cat'
+```
+can now be reached via other peers:
+```
+# on 10.0.0.2
+$ ncat -u 10.0.0.1 12345
+foo
+foo
+```
