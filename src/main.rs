@@ -33,7 +33,7 @@ pub struct Command {
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), process::ExitCode> {
   // parse command line args
   let cmd = Command::parse();
   // load config
@@ -54,11 +54,11 @@ async fn main() {
       }) => {
         log::error!("EPERM error creating TUN interface: \
           need to run with root permissions");
-        process::exit(1)
+        return Err(process::ExitCode::FAILURE)
       }
       _ => {
         log::error!("error creating VPN client: {:?}", err);
-        process::exit(1)
+        return Err(process::ExitCode::FAILURE)
       }
     }
   };
@@ -72,34 +72,35 @@ async fn main() {
     let private_key = {
       let path = std::env::var("RNS_VPN_PRIVKEY_PATH").map_err(|err|{
         log::error!("env variable RNS_VPN_PRIVKEY_PATH not found: {err:?}");
-        process::exit(1)
-      }).unwrap();
+        process::ExitCode::FAILURE
+      })?;
       log::info!("loading privkey: {path}");
       let pem_data = fs::read(&path).map_err(|err|{
         log::error!("failed to read privkey {path}: {err:?}");
-        process::exit(1)
-      }).unwrap();
+        process::ExitCode::FAILURE
+      })?;
       let pem = pem::parse(pem_data).map_err(|err|{
         log::error!("failed to parse privkey {path}: {err:?}");
-        process::exit(1)
-      }).unwrap();
+        process::ExitCode::FAILURE
+      })?;
       let pem_bytes: [u8; 32] = pem.contents()[pem.contents().len()-32..].try_into()
         .map_err(|err|{
           log::error!("invalid privkey bytes: {err:?}");
-          process::exit(1)
-        }).unwrap();
+          process::ExitCode::FAILURE
+        })?;
       x25519_dalek::StaticSecret::from(pem_bytes)
     };
     let sign_key = {
       use ed25519_dalek::pkcs8::DecodePrivateKey;
       let path = std::env::var("RNS_VPN_SIGNKEY_PATH").map_err(|err|{
         log::error!("env variable RNS_VPN_SIGNKEY_PATH not found: {err:?}");
-        process::exit(1)
-      }).unwrap();
+        process::ExitCode::FAILURE
+      })?;
       log::info!("loading signkey: {path}");
       ed25519_dalek::SigningKey::read_pkcs8_pem_file(&path).map_err(|err|{
         log::error!("failed to parse signkey {path}: {err:?}");
-      }).unwrap()
+        process::ExitCode::FAILURE
+      })?
     };
     PrivateIdentity::new(private_key, sign_key)
   };
@@ -110,4 +111,5 @@ async fn main() {
   // run
   client.run(transport, id).await;
   log::info!("server exit");
+  Ok(())
 }
