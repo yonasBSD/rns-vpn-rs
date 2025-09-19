@@ -166,7 +166,7 @@ impl Client {
           }
           LinkEvent::Activated => if link_event.address_hash == in_destination_hash {
             log::debug!("link activated {}", link_event.id);
-            // loop up destination in peers
+            // look up destination in peers
             for peer in peer_map.lock().await.values_mut() {
               if peer.link_id == Some(link_event.id) {
                 peer.link_active = true;
@@ -174,7 +174,14 @@ impl Client {
             }
           }
           LinkEvent::Closed => if link_event.address_hash == in_destination_hash {
-            log::debug!("link closed {}", link_event.id)
+            log::debug!("link closed {}", link_event.id);
+            // remove closed link
+            for peer in peer_map.lock().await.values_mut() {
+              if peer.link_id == Some(link_event.id) {
+                peer.link_active = false;
+                let _ = peer.link_id.take();
+              }
+            }
           }
         }
       }
