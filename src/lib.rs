@@ -52,7 +52,7 @@ pub struct Client {
   peer_map: Arc<Mutex<BTreeMap<IpAddr, Peer>>>,
   in_link_auths: Arc<Mutex<BTreeMap<LinkId, InLinkAuth>>>,
   tun: Arc<Tun>,
-  run_handle: Option<tokio::task::JoinHandle<()>>
+  run_handle: Option<(tokio::task::JoinHandle<()>, tokio::sync::watch::Sender<()>)>
 }
 
 #[derive(Debug)]
@@ -538,6 +538,7 @@ impl Client {
         }
       }
     };
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(());
     let run_handle = tokio::spawn(async move {
       tokio::select!{
         _ = announce_send_loop() => log::info!("announce send loop exited: shutting down"),
@@ -545,23 +546,44 @@ impl Client {
         _ = out_link_loop() => log::info!("out-link loop exited: shutting down"),
         _ = in_link_loop() => log::info!("in-link loop exited: shutting down"),
         _ = tun_loop() => log::info!("tun loop exited: shutting down"),
+        _ = shutdown_rx.changed() => log::info!("shutdown requested"),
         _ = tokio::signal::ctrl_c() => log::info!("got ctrl-c: shutting down")
       }
     });
-    client.run_handle = Some(run_handle);
+    client.run_handle = Some((run_handle, shutdown_tx));
     Ok(client)
   }
 
   /// Check if the client task is still running
   pub fn is_running(&self) -> bool {
-    self.run_handle.as_ref().map(|handle| handle.is_finished()).unwrap_or(false)
+    self.run_handle.as_ref().map(|(handle, _)| handle.is_finished()).unwrap_or(false)
   }
 
   /// Blocks until the running task exits. This will run forever unless a task exits
   /// unexpectedly.
   pub async fn await_finished(mut self) {
-    if let Some(handle) = self.run_handle.take() {
-      let _ = handle.await;
+    if let Some((handle, _)) = self.run_handle.take() {
+      match handle.await {
+        Ok(()) => log::info!("client finished"),
+        Err(err) => log::error!("error joining client task: {err}")
+      }
+    }
+  }
+
+  /// Shutdown client task (if running) and cleanup acquired resources
+  pub async fn shutdown(mut self) {
+    if let Some((handle, shutdown_tx)) = self.run_handle.take() {
+      log::debug!("sending shutdown signal");
+      match shutdown_tx.send(()) {
+        Ok(()) => match tokio::time::timeout(time::Duration::from_secs(5), handle).await {
+          Ok(result) => match result {
+            Ok(()) => log::info!("client shutdown"),
+            Err(err) => log::error!("error joining client task: {err}")
+          }
+          Err(elapsed) => log::error!("client timed out waiting for task to end: {elapsed}")
+        }
+        Err(err) => log::error!("error sending shutdown signal: {err}")
+      }
     }
   }
 
@@ -718,9 +740,24 @@ impl Client {
     let tun = Arc::new(Tun::new(vpn_ip)?);
     let run_handle = None;
     let client = Client {
-      config, transport, in_destination, tun, peer_map, in_link_auths: in_link_peers, run_handle
+      config, transport, in_destination, tun, peer_map, in_link_auths: in_link_peers,
+      run_handle
     };
     Ok(client)
+  }
+}
+
+impl Drop for Client {
+  fn drop(&mut self) {
+    if let Some((_handle, shutdown_tx)) = self.run_handle.take() {
+      log::debug!("sending shutdown signal");
+      match shutdown_tx.send(()) {
+        // note we can't await on the task handle here because drop is not async
+        // TODO: use nightly AsyncDrop trait?
+        Ok(()) => {}
+        Err(err) => log::error!("error sending shutdown signal: {err}")
+      }
+    }
   }
 }
 
@@ -781,6 +818,31 @@ impl Tun {
 
   pub async fn send(&self, datagram: &[u8]) -> Result<usize, std::io::Error> {
     self.tun.send(datagram).await
+  }
+}
+
+impl Drop for Tun {
+  fn drop(&mut self) {
+    match self.tun.close() {
+      Ok(()) => {}
+      Err(err) => {
+        log::error!("error closing tun device: {err}");
+        // try taking down the interface manually
+        log::debug!("{} setting link down", self.tun.name());
+        if let Ok(output) = std::process::Command::new("ip")
+          .arg("link")
+          .arg("set")
+          .arg("dev")
+          .arg(self.tun.name())
+          .arg("down")
+          .output()
+        {
+          if !output.status.success() {
+            log::error!("ip link down command failed ({:?})", output.status.code())
+          }
+        }
+      }
+    }
   }
 }
 
