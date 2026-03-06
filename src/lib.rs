@@ -82,6 +82,15 @@ pub enum PeerRemoveError {
   NotFound
 }
 
+/// Peer information returned from `client.peer_list()`
+#[derive(Clone)]
+pub struct PeerInfo {
+  pub dest: AddressHash,
+  pub ip_addr: IpAddr,
+  pub in_link_id: Option<LinkId>,
+  pub out_link_id: Option<LinkId>
+}
+
 #[derive(Clone)]
 struct Peer {
   dest: AddressHash,
@@ -545,6 +554,18 @@ impl Client {
     }
   }
 
+  /// Return the current peer list
+  pub async fn peer_list(&self) -> BTreeMap<AddressHash, PeerInfo> {
+    self.peer_map.lock().await.iter().map(|(ip_addr, peer)|{
+      (peer.dest, PeerInfo {
+        dest: peer.dest,
+        ip_addr: *ip_addr,
+        in_link_id: peer.in_link_id,
+        out_link_id: peer.out_link_id,
+      })
+    }).collect()
+  }
+
   /// Add peer
   pub async fn peer_add(&self, destination: AddressHash) -> Result<(), PeerAddError> {
     add_peer(
@@ -777,6 +798,16 @@ impl Drop for Tun {
       }
     }
   }
+}
+
+impl std::fmt::Debug for PeerInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+      f.debug_struct("PeerInfo")
+        .field("dest", &self.dest.to_string())
+        .field("in_link_id", &self.in_link_id.as_ref().map(ToString::to_string))
+        .field("out_link_id", &self.out_link_id.as_ref().map(ToString::to_string))
+        .finish()
+    }
 }
 
 impl Peer {
