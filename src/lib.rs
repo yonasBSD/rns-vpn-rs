@@ -42,7 +42,10 @@ pub struct Config {
   /// List of peer destination hashes
   pub peers: Vec<String>,
   #[serde(default = "default_announce_freq_secs")]
-  pub announce_freq_secs: u32
+  pub announce_freq_secs: u32,
+  /// Add to the peer list any peers opening an in-link for the local input destination
+  #[serde(default)]
+  pub allow_all: bool
 }
 
 pub struct Client {
@@ -90,6 +93,15 @@ struct Peer {
   /// If we have not yet received a peers announce we need to wait until it is received
   /// so we can validate the signature
   received_auth_payload: Option<[u8; AUTH_SIZE]>,
+}
+
+#[derive(Debug)]
+#[allow(dead_code)]
+enum PeerAuthError {
+  MissingInLinkAuth(LinkId),
+  InLinkAlreadyAuthorized(LinkId, AddressHash),
+  InvalidSignature(LinkId, AddressHash),
+  InvalidPayload(LinkId)
 }
 
 struct InLinkAuth {
@@ -158,7 +170,6 @@ impl Client {
       let mut announce_recv = transport.lock().await.recv_announces().await;
       while let Ok(announce) = announce_recv.recv().await {
         let destination = announce.destination.lock().await;
-        let mut sig_buffer = [0u8; SIG_BUFFER_SIZE];
         // look up destination in peers
         // TODO: constant time peer lookup?
         for peer in peer_map.lock().await.values_mut() {
@@ -173,7 +184,10 @@ impl Client {
               // if the peer has received an auth payload we can now validate it
               if let Some(auth_payload) = peer.received_auth_payload {
                 if let Some(in_link_id) = peer.in_link_id {
-                  let close_link = async || {
+                  if let Err(err) = peer_auth(
+                    in_link_auths.clone(), in_link_id, peer, auth_payload.as_slice()
+                  ).await {
+                    log::error!("peer auth error: {err:?}");
                     // close the link
                     let transport = transport.lock().await;
                     if let Some(link) = transport.find_in_link(&in_link_id).await.clone() {
@@ -184,46 +198,6 @@ impl Client {
                     } else {
                       log::warn!("could not find in-link {}", in_link_id);
                       debug_assert!(false, "could not find in-link {}", in_link_id);
-                    }
-                  };
-                  match Signature::from_slice(&auth_payload[ADDRESS_HASH_SIZE..]) {
-                    Ok(signature) => {
-                      sig_buffer[..ADDRESS_HASH_SIZE].copy_from_slice(&auth_payload[..ADDRESS_HASH_SIZE]);
-                      if let Some(auth) = in_link_auths.lock().await.get_mut(&in_link_id) {
-                        sig_buffer[ADDRESS_HASH_SIZE..].copy_from_slice(&auth.sent_nonce);
-                      } else {
-                        log::error!("in-link id {} missing from in-link peers list", in_link_id);
-                        close_link().await;
-                        break
-                      }
-                      if verify_key.verify_strict(&sig_buffer, &signature).is_ok() {
-                        log::debug!("authorized remote peer {} for in-link {}", peer.dest, in_link_id);
-                        if let Some(auth) = in_link_auths.lock().await.get_mut(&in_link_id) {
-                          debug_assert!(auth.authorized_peer.is_none());
-                          if let Some(dest) = auth.authorized_peer && dest != peer.dest {
-                            log::warn!("in-link peers list already has peer {dest} for in-link {}",
-                              in_link_id);
-                            close_link().await;
-                            break
-                          } else {
-                            auth.authorized_peer = Some(peer.dest);
-                          }
-                        } else {
-                          log::error!("in-link id {} missing from in-link peers list", in_link_id);
-                        }
-                      }
-                    }
-                    Err(err) => {
-                      log::error!("failed to load signature bytes for peer {} auth packet: {err}",
-                        peer.dest);
-                      if let Some(in_link_id) = peer.in_link_id {
-                        if let Some(link) = transport.lock().await
-                          .find_in_link(&in_link_id).await.clone()
-                        {
-                          log::warn!("closing in-link {in_link_id} for peer {}", peer.dest);
-                          link.lock().await.close();
-                        }
-                      }
                     }
                   }
                 }
@@ -313,13 +287,15 @@ impl Client {
     };
     // upstream link data: put link data into tun
     let transport = transport_clone.clone();
+    let tun = client.tun.clone();
     let peer_map = client.peer_map.clone();
     let in_link_auths = client.in_link_auths.clone();
-    let tun = client.tun.clone();
+    let in_destination = client.in_destination.clone();
+    let network = client.config.network;
+    let allow_all = client.config.allow_all;
     let in_link_loop = async move || {
       let peer_map = peer_map.clone();
       let mut nonce_buffer = [0u8; AUTH_NONCE_BYTES];
-      let mut sig_buffer = [0u8; SIG_BUFFER_SIZE];
       let mut in_link_events = transport.lock().await.in_link_events();
       loop {
         match in_link_events.recv().await {
@@ -347,7 +323,7 @@ impl Client {
                     log::warn!("in-link peers list missing link id {}", link_event.id);
                   }
                 } else {
-                  // peer id notification
+                  // peer auth notification
                   debug_assert_eq!(data[0], PEER_AUTH_BYTE);
                   let close_link = async || {
                     // close the link
@@ -382,67 +358,49 @@ impl Client {
                           peer.dest, link_event.id);
                       }
                       peer.in_link_id = Some(link_event.id);
-                      // validate signature
-                      if let Some(verify_key) = peer.verify_key.as_ref() {
-                        match Signature::from_slice(&auth_data[ADDRESS_HASH_SIZE..]) {
-                          Ok(signature) => {
-                            sig_buffer[..ADDRESS_HASH_SIZE].copy_from_slice(&auth_data[..ADDRESS_HASH_SIZE]);
-                            if let Some(auth) = in_link_auths.lock().await.get_mut(&link_event.id) {
-                              sig_buffer[ADDRESS_HASH_SIZE..].copy_from_slice(&auth.sent_nonce);
-                            } else {
-                              log::error!("in-link id {} missing from in-link peers list", link_event.id);
-                              close_link().await;
-                              break
-                            }
-                            if verify_key.verify_strict(&sig_buffer, &signature).is_ok() {
-                              log::debug!("authorized remote peer {peer_dest} on in-link {}",
-                                link_event.id);
-                              if let Some(auth) = in_link_auths.lock().await.get_mut(&link_event.id) {
-                                debug_assert!(auth.authorized_peer.is_none());
-                                if let Some(dest) = auth.authorized_peer && dest != peer.dest {
-                                  log::warn!("in-link peers list already has peer {dest} for in-link {}",
-                                    link_event.id);
-                                  close_link().await;
-                                  break
-                                }
-                                auth.authorized_peer = Some(peer_dest);
-                              } else {
-                                log::error!("in-link id {} missing from in-link peers list", link_event.id);
-                                close_link().await;
-                                break
-                              }
-                            } else {
-                              log::warn!("auth signature failed for peer {peer_dest} on in-link {}",
-                                link_event.id);
-                              close_link().await;
-                              break
-                            }
-                          }
-                          Err(err) => {
-                            log::error!("failed to load signature bytes for peer {peer_dest} auth packet: {err}");
-                            close_link().await;
-                            break
-                          }
-                        }
-                      } else {
-                        // we don't have the peer's verify key yet: stash the auth data
-                        // until it can be verified
-                        log::debug!("could not yet authenticate peer {peer_dest} on in-link {}: missing verify key",
-                          link_event.id);
-                        if let Ok(auth_payload) = auth_data.try_into() {
-                          peer.received_auth_payload = Some(auth_payload);
-                        } else {
-                          log::warn!("invalid auth payload size, closing in-link {}", link_event.id);
-                          close_link().await;
-                          break
-                        }
+                      if let Err(err) = peer_auth(
+                        in_link_auths.clone(), link_event.id, peer, auth_data
+                      ).await {
+                        log::error!("peer auth error: {err:?}");
+                        close_link().await;
+                        break
                       }
                     }
                   }
                   if !peer_found {
-                    log::warn!("could not find peer {peer_dest} to validate in-link {}",
-                      link_event.id);
-                    close_link().await;
+                    if !allow_all {
+                      log::warn!("could not find peer {peer_dest} to validate in-link {}",
+                        link_event.id);
+                      close_link().await;
+                    } else {
+                      // allow all mode: add this peer to peer map
+                      log::info!("adding new peer: {peer_dest}");
+                      if let Err(err) = add_peer(
+                        transport.clone(),
+                        peer_map.clone(),
+                        network,
+                        in_destination.lock().await.desc.address_hash,
+                        peer_dest
+                      ).await {
+                        log::warn!("error adding new peer {peer_dest}: {err:?}");
+                        close_link().await;
+                      } else {
+                        if let Some(peer) = peer_map.lock().await.values_mut()
+                          .find(|p| p.dest == peer_dest)
+                        {
+                          peer.in_link_id = Some(link_event.id);
+                          if let Err(err) = peer_auth(
+                            in_link_auths.clone(), link_event.id, peer, auth_data
+                          ).await {
+                            log::error!("peer auth error: {err:?}");
+                            close_link().await;
+                          }
+                        } else {
+                          log::warn!("peer was removed, closing link");
+                          close_link().await;
+                        }
+                      }
+                    }
                   }
                 }
               }
@@ -589,38 +547,13 @@ impl Client {
 
   /// Add peer
   pub async fn peer_add(&self, destination: AddressHash) -> Result<(), PeerAddError> {
-    let ip = destination_to_ip(destination, self.config.network).addr();
-    let in_destination = self.in_destination.lock().await.desc.address_hash;
-    let local_ip = destination_to_ip(in_destination, self.config.network).addr();
-    if ip == local_ip {
-      log::warn!("the IP for peer {destination} conflicts with the local IP: {local_ip}");
-      return Err(PeerAddError::IpConflicts(in_destination, ip))
-    }
-    let peer_map = self.peer_map.lock().await;
-    if let Some(existing_peer) = peer_map.get(&ip) {
-      if existing_peer.dest == destination {
-        log::warn!("peer add ({destination}): already exists");
-        return Err(PeerAddError::AlreadyExists)
-      } else {
-        log::warn!("peer add ({destination}): ip {ip} conflicts with peer {}",
-          existing_peer.dest);
-        return Err(PeerAddError::IpConflicts(existing_peer.dest, ip))
-      }
-    }
-    drop(peer_map);
-    log::debug!("adding peer {destination}");
-    let mut peer = Peer::new(destination);
-    let transport = self.transport.lock().await;
-    if let Some(dest) = transport.get_out_destination(&destination).await {
-      let link = transport.link(dest.lock().await.desc).await;
-      drop(transport);
-      peer.out_link_id = Some(link.lock().await.id().clone());
-      log::debug!("created out-link {} for peer {}",
-        peer.out_link_id.as_ref().unwrap(), peer.dest);
-    }
-    let res = self.peer_map.lock().await.insert(ip, peer);
-    debug_assert!(res.is_none());
-    Ok(())
+    add_peer(
+      self.transport.clone(),
+      self.peer_map.clone(),
+      self.config.network,
+      self.in_destination.lock().await.desc.address_hash,
+      destination
+    ).await
   }
 
   /// Remove peer and close link
@@ -902,6 +835,107 @@ fn destination_to_ip(destination: AddressHash, prefix: cidr::Ipv4Cidr) -> IpNet 
   let host_bits = (!network_bits) & n;
   let addr = Ipv4Addr::from_bits(prefix.first_address().to_bits() | host_bits);
   IpNet::new(IpAddr::V4(addr), network_bits.count_ones() as u8).unwrap()
+}
+
+async fn add_peer(
+  transport: Arc<Mutex<Transport>>,
+  peer_map: Arc<Mutex<BTreeMap<IpAddr, Peer>>>,
+  network: cidr::Ipv4Cidr,
+  local_in_destination: AddressHash,
+  destination: AddressHash
+) -> Result<(), PeerAddError> {
+  let ip = destination_to_ip(destination, network).addr();
+  let local_ip = destination_to_ip(local_in_destination, network).addr();
+  if ip == local_ip {
+    log::warn!("the IP for peer {destination} conflicts with the local IP: {local_ip}");
+    return Err(PeerAddError::IpConflicts(local_in_destination, ip))
+  }
+  {
+    let peer_map = peer_map.lock().await;
+    if let Some(existing_peer) = peer_map.get(&ip) {
+      if existing_peer.dest == destination {
+        log::warn!("peer add ({destination}): already exists");
+        return Err(PeerAddError::AlreadyExists)
+      } else {
+        log::warn!("peer add ({destination}): ip {ip} conflicts with peer {}",
+          existing_peer.dest);
+        return Err(PeerAddError::IpConflicts(existing_peer.dest, ip))
+      }
+    }
+    drop(peer_map);
+  }
+  log::debug!("adding peer {destination}");
+  let mut peer = Peer::new(destination);
+  let transport = transport.lock().await;
+  if let Some(dest) = transport.get_out_destination(&destination).await {
+    let link = transport.link(dest.lock().await.desc).await;
+    drop(transport);
+    peer.out_link_id = Some(link.lock().await.id().clone());
+    log::debug!("created out-link {} for peer {}",
+      peer.out_link_id.as_ref().unwrap(), peer.dest);
+  }
+  let res = peer_map.lock().await.insert(ip, peer);
+  debug_assert!(res.is_none());
+  Ok(())
+}
+
+async fn peer_auth(
+  in_link_auths: Arc<Mutex<BTreeMap<LinkId, InLinkAuth>>>,
+  in_link_id: LinkId,
+  peer: &mut Peer,
+  auth_data: &[u8]
+) -> Result<(), PeerAuthError> {
+  let mut sig_buffer = [0u8; SIG_BUFFER_SIZE];
+  // validate signature
+  if let Some(verify_key) = peer.verify_key.as_ref() {
+    match Signature::from_slice(&auth_data[ADDRESS_HASH_SIZE..]) {
+      Ok(signature) => {
+        sig_buffer[..ADDRESS_HASH_SIZE].copy_from_slice(&auth_data[..ADDRESS_HASH_SIZE]);
+        if let Some(auth) = in_link_auths.lock().await.get_mut(&in_link_id) {
+          sig_buffer[ADDRESS_HASH_SIZE..].copy_from_slice(&auth.sent_nonce);
+        } else {
+          log::error!("in-link id {} missing from in-link peers list", in_link_id);
+          return Err(PeerAuthError::MissingInLinkAuth(in_link_id))
+        }
+        if verify_key.verify_strict(&sig_buffer, &signature).is_ok() {
+          log::debug!("authorized remote peer {} on in-link {}", peer.dest, in_link_id);
+          if let Some(auth) = in_link_auths.lock().await.get_mut(&in_link_id) {
+            debug_assert!(auth.authorized_peer.is_none());
+            if let Some(dest) = auth.authorized_peer && dest != peer.dest {
+              log::warn!("in-link peers list already has peer {dest} for in-link {}",
+                in_link_id);
+              return Err(PeerAuthError::InLinkAlreadyAuthorized(in_link_id, dest))
+            }
+            auth.authorized_peer = Some(peer.dest);
+          } else {
+            log::error!("in-link id {} missing from in-link peers list", in_link_id);
+            return Err(PeerAuthError::MissingInLinkAuth(in_link_id))
+          }
+        } else {
+          log::warn!("auth signature failed for peer {} on in-link {}",
+            peer.dest, in_link_id);
+          return Err(PeerAuthError::InvalidSignature(in_link_id, peer.dest))
+        }
+      }
+      Err(err) => {
+        log::error!("failed to load signature bytes for peer {} auth packet: {err}",
+          peer.dest);
+        return Err(PeerAuthError::InvalidSignature(in_link_id, peer.dest))
+      }
+    }
+  } else {
+    // we don't have the peer's verify key yet: stash the auth data until it can be
+    // verified
+    log::debug!("could not yet authenticate peer {} on in-link {}: missing verify key",
+      peer.dest, in_link_id);
+    if let Ok(auth_payload) = auth_data.try_into() {
+      peer.received_auth_payload = Some(auth_payload);
+    } else {
+      log::warn!("invalid auth payload size, closing in-link {}", in_link_id);
+      return Err(PeerAuthError::InvalidPayload(in_link_id))
+    }
+  }
+  Ok(())
 }
 
 #[cfg(test)]
