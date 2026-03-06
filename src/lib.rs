@@ -932,10 +932,12 @@ async fn peer_auth(
           log::debug!("authorized remote peer {} on in-link {}", peer.dest, in_link_id);
           if let Some(auth) = in_link_auths.lock().await.get_mut(&in_link_id) {
             debug_assert!(auth.authorized_peer.is_none());
-            if let Some(dest) = auth.authorized_peer && dest != peer.dest {
-              log::warn!("in-link peers list already has peer {dest} for in-link {}",
-                in_link_id);
-              return Err(PeerAuthError::InLinkAlreadyAuthorized(in_link_id, dest))
+            if let Some(dest) = auth.authorized_peer {
+              if dest != peer.dest {
+                log::warn!("in-link peers list already has peer {dest} for in-link {}",
+                  in_link_id);
+                return Err(PeerAuthError::InLinkAlreadyAuthorized(in_link_id, dest))
+              }
             }
             auth.authorized_peer = Some(peer.dest);
           } else {
