@@ -146,7 +146,7 @@ impl Client {
         transport.lock().await.send_announce(&in_destination, None).await;
         // close any in-links that have not authorized within the timeout
         let now = time::Instant::now();
-        for (id, auth) in in_link_auths.lock().await.iter() {
+        in_link_auths.lock().await.retain(|id, auth|{
           let age = now - auth.link_open_ts;
           let close = auth.authorized_peer.is_none() && age >= IN_LINK_AUTH_TIMEOUT;
           if close {
@@ -154,18 +154,11 @@ impl Client {
               age);
             close_in_links.push(*id);
           }
-        }
+          !close
+        });
         for in_link_id in close_in_links.drain(..) {
-          let transport = transport.lock().await;
-          if let Some(link) = transport.find_in_link(&in_link_id).await.clone() {
-            drop(transport);
-            log::debug!("closing in-link {}", in_link_id);
-            link.lock().await.close();
-            // LinkEvent::Closed handling will take care of cleaning up
-          } else {
-            log::warn!("could not find in-link {}", in_link_id);
-            debug_assert!(false, "could not find in-link {}", in_link_id);
-          }
+          let _ = transport.lock().await.link_close(in_link_id).await.map_err(|err|
+            log::warn!("error closing in-link {in_link_id}: {err:?}"));
         }
         tokio::time::sleep(time::Duration::from_secs(announce_freq_secs)).await;
       }
@@ -183,32 +176,28 @@ impl Client {
         // TODO: constant time peer lookup?
         for peer in peer_map.lock().await.values_mut() {
           if destination.desc.address_hash == peer.dest {
+            // create the out-link if not created
             if peer.out_link_id.is_none() {
-              let verify_key = destination.desc.identity.verifying_key;
-              peer.verify_key = Some(verify_key);
               let link = transport.lock().await.link(destination.desc).await;
               peer.out_link_id = Some(link.lock().await.id().clone());
               log::debug!("requested out-link {} for peer {}",
                 peer.out_link_id.as_ref().unwrap(), peer.dest);
-              // if the peer has received an auth payload we can now validate it
-              if let Some(auth_payload) = peer.received_auth_payload {
-                if let Some(in_link_id) = peer.in_link_id {
-                  if let Err(err) = peer_auth(
-                    in_link_auths.clone(), in_link_id, peer, auth_payload.as_slice()
-                  ).await {
-                    log::error!("peer auth error: {err:?}");
-                    // close the link
-                    let transport = transport.lock().await;
-                    if let Some(link) = transport.find_in_link(&in_link_id).await.clone() {
-                      drop(transport);
-                      log::warn!("closing in-link {}", in_link_id);
-                      link.lock().await.close();
-                      // LinkEvent::Closed handling will take care of cleaning up
-                    } else {
-                      log::warn!("could not find in-link {}", in_link_id);
-                      debug_assert!(false, "could not find in-link {}", in_link_id);
-                    }
-                  }
+            }
+            // set the verify key
+            let verify_key = destination.desc.identity.verifying_key;
+            peer.verify_key = Some(verify_key);
+            // if the peer has received an auth payload we can now validate it with the
+            // verifying key
+            if let Some(auth_payload) = peer.received_auth_payload.take() {
+              if let Some(in_link_id) = peer.in_link_id {
+                if let Err(err) = peer_auth(
+                  in_link_auths.clone(), in_link_id, peer, auth_payload.as_slice()
+                ).await {
+                  log::error!("peer auth error: {err:?}");
+                  // close the link
+                  log::warn!("closing in-link {}", in_link_id);
+                  let _ = transport.lock().await.link_close(in_link_id).await.map_err(|err|
+                    log::error!("error closing in-link {in_link_id}: {err:?}"));
                 }
               }
             }
@@ -336,16 +325,9 @@ impl Client {
                   debug_assert_eq!(data[0], PEER_AUTH_BYTE);
                   let close_link = async || {
                     // close the link
-                    let transport = transport.lock().await;
-                    if let Some(link) = transport.find_in_link(&link_event.id).await.clone() {
-                      drop(transport);
-                      log::warn!("closing in-link {}", link_event.id);
-                      link.lock().await.close();
-                      // LinkEvent::Closed handling will take care of cleaning up
-                    } else {
-                      log::warn!("could not find in-link {}", link_event.id);
-                      debug_assert!(false, "could not find in-link {}", link_event.id);
-                    }
+                    log::warn!("closing in-link {}", link_event.id);
+                    let _ = transport.lock().await.link_close(link_event.id).await.map_err(|err|
+                      log::error!("error closing in-link {}: {err:?}", link_event.id));
                   };
                   let auth_data = &data[1..1 + AUTH_SIZE];
                   let address_bytes = match auth_data[..ADDRESS_HASH_SIZE].try_into() {
@@ -591,20 +573,14 @@ impl Client {
         let peer = peer_map.remove(&ip).unwrap();
         drop(peer_map);
         if let Some(link_id) = peer.out_link_id {
-          let transport = self.transport.lock().await;
-          if let Some(link) = transport.find_out_link(&peer.dest).await.clone() {
-            drop(transport);
-            log::debug!("closing out-link {link_id} for peer {}", peer.dest);
-            link.lock().await.close();
-          }
+          log::debug!("closing out-link {link_id} for peer {}", peer.dest);
+          let _ = self.transport.lock().await.link_close(peer.dest).await.map_err(|err|
+            log::error!("error closing out-link {link_id}: {err:?}"));
         }
         if let Some(link_id) = peer.in_link_id {
-          let transport = self.transport.lock().await;
-          if let Some(link) = transport.find_in_link(&link_id).await.clone() {
-            drop(transport);
-            log::debug!("closing in-link {link_id} for peer {}", peer.dest);
-            link.lock().await.close();
-          }
+          log::debug!("closing in-link {link_id} for peer {}", peer.dest);
+          let _ = self.transport.lock().await.link_close(link_id).await.map_err(|err|
+            log::error!("error closing in-link {link_id}: {err:?}"));
         }
         log::debug!("removed peer {destination}");
         Ok(())
@@ -625,20 +601,14 @@ impl Client {
     let mut peer_map = self.peer_map.lock().await;
     for peer in peer_map.values() {
       if let Some(link_id) = peer.out_link_id {
-        let transport = self.transport.lock().await;
-        if let Some(link) = transport.find_out_link(&peer.dest).await.clone() {
-          drop(transport);
-          log::debug!("closing out-link {link_id} for peer {}", peer.dest);
-          link.lock().await.close();
-        }
+        log::debug!("closing out-link {link_id} for peer {}", peer.dest);
+        let _ = self.transport.lock().await.link_close(peer.dest).await.map_err(|err|
+          log::error!("error closing out-link {link_id}: {err:?}"));
       }
       if let Some(link_id) = peer.in_link_id {
-        let transport = self.transport.lock().await;
-        if let Some(link) = transport.find_in_link(&link_id).await.clone() {
-          drop(transport);
-          log::debug!("closing in-link {link_id} for peer {}", peer.dest);
-          link.lock().await.close();
-        }
+        log::debug!("closing in-link {link_id} for peer {}", peer.dest);
+        let _ = self.transport.lock().await.link_close(link_id).await.map_err(|err|
+          log::error!("error closing in-link {link_id}: {err:?}"));
       }
     }
     peer_map.clear();

@@ -17,8 +17,7 @@ serde = { version = "1.*", features = ["derive"] }
 tokio = { version = "1.44.*", features = ["full"] }
 
 [dependencies.reticulum]
-#git = "https://github.com/BeechatNetworkSystemsLtd/Reticulum-rs"
-path = "../Reticulum-rs"
+git = "https://github.com/BeechatNetworkSystemsLtd/Reticulum-rs"
 version = "0.1.*"
 
 [workspace]
