@@ -625,6 +625,7 @@ impl Client {
     log::info!("created destination: {}",
       format!("{}", in_destination_hash).trim_matches('/'));
     let local_ip = destination_to_ip(in_destination_hash, config.network);
+    log::info!("local ip: {local_ip}");
     // set up peer map
     if config.peers.is_empty() {
       log::warn!("no peers configured");
